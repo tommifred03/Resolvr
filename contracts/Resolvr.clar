@@ -13,12 +13,19 @@
 (define-constant ERR_INVALID_EVIDENCE_TYPE (err u111))
 (define-constant ERR_DUPLICATE_EVIDENCE (err u112))
 (define-constant ERR_EVIDENCE_SUBMISSION_CLOSED (err u113))
+(define-constant ERR_INVALID_EXPERTISE (err u114))
+(define-constant ERR_EXPERTISE_NOT_FOUND (err u115))
+(define-constant ERR_INSUFFICIENT_CERTIFICATION (err u116))
+(define-constant ERR_ALREADY_SPECIALIZED (err u117))
+(define-constant ERR_INVALID_CERTIFICATION_LEVEL (err u118))
 
 (define-data-var dispute-counter uint u0)
 (define-data-var arbitrator-fee uint u1000000)
 (define-data-var voting-period uint u144)
 (define-data-var evidence-counter uint u0)
 (define-data-var evidence-submission-period uint u72)
+(define-data-var expertise-counter uint u0)
+(define-data-var min-certification-cases uint u10)
 
 (define-map disputes
   uint
@@ -87,6 +94,58 @@
 (define-map evidence-quality-votes
   { evidence-id: uint, voter: principal }
   { quality-rating: uint, voted-at: uint }
+)
+
+(define-map arbitrator-expertise
+  { arbitrator: principal, expertise-domain: (string-ascii 30) }
+  {
+    certification-level: uint,
+    cases-handled: uint,
+    success-rate: uint,
+    average-rating: uint,
+    registered-at: uint,
+    last-updated: uint
+  }
+)
+
+(define-map expertise-domains
+  (string-ascii 30)
+  {
+    domain-id: uint,
+    total-arbitrators: uint,
+    active-arbitrators: uint,
+    created-at: uint
+  }
+)
+
+(define-map dispute-expertise-requirements
+  uint
+  {
+    required-domain: (string-ascii 30),
+    min-certification: uint,
+    weighted-voting: bool,
+    domain-multiplier: uint
+  }
+)
+
+(define-map arbitrator-performance
+  { arbitrator: principal, expertise-domain: (string-ascii 30) }
+  {
+    total-votes: uint,
+    correct-predictions: uint,
+    disputed-decisions: uint,
+    peer-ratings: uint,
+    last-performance-update: uint
+  }
+)
+
+(define-map expertise-match-assignments
+  { dispute-id: uint, arbitrator: principal }
+  {
+    expertise-match-score: uint,
+    auto-assigned: bool,
+    assignment-weight: uint
+  }
 )
 
 (define-public (register-arbitrator (stake-amount uint))
@@ -361,6 +420,182 @@
   )
 )
 
+(define-public (register-expertise-domain (domain-name (string-ascii 30)))
+  (let (
+    (domain-id (+ (var-get expertise-counter) u1))
+    (existing-domain (map-get? expertise-domains domain-name))
+  )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (is-none existing-domain) ERR_ALREADY_SPECIALIZED)
+    (asserts! (or (is-eq domain-name "legal") (is-eq domain-name "technical") (is-eq domain-name "financial") (is-eq domain-name "commercial") (is-eq domain-name "intellectual-property") (is-eq domain-name "employment") (is-eq domain-name "real-estate") (is-eq domain-name "crypto") (is-eq domain-name "general")) ERR_INVALID_EXPERTISE)
+    
+    (map-set expertise-domains domain-name {
+      domain-id: domain-id,
+      total-arbitrators: u0,
+      active-arbitrators: u0,
+      created-at: stacks-block-height
+    })
+    (var-set expertise-counter domain-id)
+    (ok domain-id)
+  )
+)
+
+(define-public (add-arbitrator-expertise (expertise-domain (string-ascii 30)))
+  (let (
+    (arbitrator tx-sender)
+    (arbitrator-info (unwrap! (map-get? arbitrators arbitrator) ERR_NOT_ARBITRATOR))
+    (domain-info (unwrap! (map-get? expertise-domains expertise-domain) ERR_EXPERTISE_NOT_FOUND))
+    (existing-expertise (map-get? arbitrator-expertise { arbitrator: arbitrator, expertise-domain: expertise-domain }))
+  )
+    (asserts! (get active arbitrator-info) ERR_NOT_AUTHORIZED)
+    (asserts! (is-none existing-expertise) ERR_ALREADY_SPECIALIZED)
+    (asserts! (>= (get total-cases arbitrator-info) (var-get min-certification-cases)) ERR_INSUFFICIENT_CERTIFICATION)
+    
+    (map-set arbitrator-expertise { arbitrator: arbitrator, expertise-domain: expertise-domain } {
+      certification-level: u1,
+      cases-handled: u0,
+      success-rate: u50,
+      average-rating: u5,
+      registered-at: stacks-block-height,
+      last-updated: stacks-block-height
+    })
+    
+    (map-set arbitrator-performance { arbitrator: arbitrator, expertise-domain: expertise-domain } {
+      total-votes: u0,
+      correct-predictions: u0,
+      disputed-decisions: u0,
+      peer-ratings: u0,
+      last-performance-update: stacks-block-height
+    })
+    
+    (map-set expertise-domains expertise-domain (merge domain-info {
+      total-arbitrators: (+ (get total-arbitrators domain-info) u1),
+      active-arbitrators: (+ (get active-arbitrators domain-info) u1)
+    }))
+    (ok true)
+  )
+)
+
+(define-public (set-dispute-expertise-requirement (dispute-id uint) (required-domain (string-ascii 30)) (min-certification uint) (weighted-voting bool) (domain-multiplier uint))
+  (let (
+    (dispute (unwrap! (map-get? disputes dispute-id) ERR_DISPUTE_NOT_FOUND))
+    (requester tx-sender)
+    (domain-info (unwrap! (map-get? expertise-domains required-domain) ERR_EXPERTISE_NOT_FOUND))
+  )
+    (asserts! (or (is-eq requester (get plaintiff dispute)) (is-eq requester (get defendant dispute))) ERR_NOT_AUTHORIZED)
+    (asserts! (<= min-certification u5) ERR_INVALID_CERTIFICATION_LEVEL)
+    (asserts! (>= min-certification u1) ERR_INVALID_CERTIFICATION_LEVEL)
+    (asserts! (<= domain-multiplier u10) ERR_INVALID_CERTIFICATION_LEVEL)
+    (asserts! (>= domain-multiplier u1) ERR_INVALID_CERTIFICATION_LEVEL)
+    (asserts! (is-eq (get status dispute) "pending") ERR_INVALID_STATUS)
+    
+    (map-set dispute-expertise-requirements dispute-id {
+      required-domain: required-domain,
+      min-certification: min-certification,
+      weighted-voting: weighted-voting,
+      domain-multiplier: domain-multiplier
+    })
+    (ok true)
+  )
+)
+
+(define-public (calculate-expertise-match-score (dispute-id uint) (arbitrator principal))
+  (let (
+    (dispute (unwrap! (map-get? disputes dispute-id) ERR_DISPUTE_NOT_FOUND))
+    (arbitrator-info (unwrap! (map-get? arbitrators arbitrator) ERR_NOT_ARBITRATOR))
+    (expertise-req (map-get? dispute-expertise-requirements dispute-id))
+  )
+    (asserts! (get active arbitrator-info) ERR_NOT_AUTHORIZED)
+    (match expertise-req
+      req (let (
+        (required-domain (get required-domain req))
+        (arbitrator-expertise-info (map-get? arbitrator-expertise { arbitrator: arbitrator, expertise-domain: required-domain }))
+        (performance-info (map-get? arbitrator-performance { arbitrator: arbitrator, expertise-domain: required-domain }))
+      )
+        (match arbitrator-expertise-info
+          expertise (let (
+            (certification-level (get certification-level expertise))
+            (success-rate (get success-rate expertise))
+            (average-rating (get average-rating expertise))
+            (cases-handled (get cases-handled expertise))
+            (base-score (+ certification-level (* success-rate u2)))
+            (experience-bonus (if (>= cases-handled u5) u20 u0))
+            (rating-bonus (* average-rating u5))
+            (final-score (+ base-score experience-bonus rating-bonus))
+          )
+            (asserts! (>= certification-level (get min-certification req)) ERR_INSUFFICIENT_CERTIFICATION)
+            (map-set expertise-match-assignments { dispute-id: dispute-id, arbitrator: arbitrator } {
+              expertise-match-score: final-score,
+              auto-assigned: true,
+              assignment-weight: (get domain-multiplier req)
+            })
+            (ok final-score)
+          )
+          (ok u0)
+        )
+      )
+      (ok u50)
+    )
+  )
+)
+
+(define-public (update-arbitrator-performance (arbitrator principal) (expertise-domain (string-ascii 30)) (decision-correct bool) (peer-rating uint))
+  (let (
+    (caller tx-sender)
+    (caller-arbitrator-info (unwrap! (map-get? arbitrators caller) ERR_NOT_ARBITRATOR))
+    (target-expertise (unwrap! (map-get? arbitrator-expertise { arbitrator: arbitrator, expertise-domain: expertise-domain }) ERR_EXPERTISE_NOT_FOUND))
+    (current-performance (default-to { total-votes: u0, correct-predictions: u0, disputed-decisions: u0, peer-ratings: u0, last-performance-update: u0 } (map-get? arbitrator-performance { arbitrator: arbitrator, expertise-domain: expertise-domain })))
+  )
+    (asserts! (get active caller-arbitrator-info) ERR_NOT_AUTHORIZED)
+    (asserts! (<= peer-rating u10) ERR_INVALID_CERTIFICATION_LEVEL)
+    (asserts! (>= peer-rating u1) ERR_INVALID_CERTIFICATION_LEVEL)
+    
+    (let (
+      (new-total-votes (+ (get total-votes current-performance) u1))
+      (new-correct-predictions (if decision-correct (+ (get correct-predictions current-performance) u1) (get correct-predictions current-performance)))
+      (new-peer-ratings (+ (get peer-ratings current-performance) peer-rating))
+      (new-success-rate (if (> new-total-votes u0) (/ (* new-correct-predictions u100) new-total-votes) u50))
+      (new-average-rating (if (> new-total-votes u0) (/ new-peer-ratings new-total-votes) u5))
+    )
+      (map-set arbitrator-performance { arbitrator: arbitrator, expertise-domain: expertise-domain } {
+        total-votes: new-total-votes,
+        correct-predictions: new-correct-predictions,
+        disputed-decisions: (get disputed-decisions current-performance),
+        peer-ratings: new-peer-ratings,
+        last-performance-update: stacks-block-height
+      })
+      
+      (map-set arbitrator-expertise { arbitrator: arbitrator, expertise-domain: expertise-domain } (merge target-expertise {
+        success-rate: new-success-rate,
+        average-rating: new-average-rating,
+        last-updated: stacks-block-height
+      }))
+    )
+    (ok true)
+  )
+)
+
+(define-public (promote-arbitrator-certification (arbitrator principal) (expertise-domain (string-ascii 30)))
+  (let (
+    (target-expertise (unwrap! (map-get? arbitrator-expertise { arbitrator: arbitrator, expertise-domain: expertise-domain }) ERR_EXPERTISE_NOT_FOUND))
+    (performance-info (unwrap! (map-get? arbitrator-performance { arbitrator: arbitrator, expertise-domain: expertise-domain }) ERR_EXPERTISE_NOT_FOUND))
+    (current-level (get certification-level target-expertise))
+    (success-rate (get success-rate target-expertise))
+    (total-votes (get total-votes performance-info))
+  )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (< current-level u5) ERR_INVALID_CERTIFICATION_LEVEL)
+    (asserts! (>= success-rate u80) ERR_INSUFFICIENT_CERTIFICATION)
+    (asserts! (>= total-votes u20) ERR_INSUFFICIENT_CERTIFICATION)
+    
+    (map-set arbitrator-expertise { arbitrator: arbitrator, expertise-domain: expertise-domain } (merge target-expertise {
+      certification-level: (+ current-level u1),
+      last-updated: stacks-block-height
+    }))
+    (ok (+ current-level u1))
+  )
+)
+
 (define-read-only (get-dispute (dispute-id uint))
   (map-get? disputes dispute-id)
 )
@@ -471,3 +706,61 @@
     false
   )
 )
+
+(define-read-only (get-arbitrator-expertise (arbitrator principal) (expertise-domain (string-ascii 30)))
+  (map-get? arbitrator-expertise { arbitrator: arbitrator, expertise-domain: expertise-domain })
+)
+
+(define-read-only (get-expertise-domain (domain-name (string-ascii 30)))
+  (map-get? expertise-domains domain-name)
+)
+
+(define-read-only (get-dispute-expertise-requirement (dispute-id uint))
+  (map-get? dispute-expertise-requirements dispute-id)
+)
+
+(define-read-only (get-arbitrator-performance (arbitrator principal) (expertise-domain (string-ascii 30)))
+  (map-get? arbitrator-performance { arbitrator: arbitrator, expertise-domain: expertise-domain })
+)
+
+(define-read-only (get-expertise-match-assignment (dispute-id uint) (arbitrator principal))
+  (map-get? expertise-match-assignments { dispute-id: dispute-id, arbitrator: arbitrator })
+)
+
+(define-read-only (get-current-expertise-counter)
+  (var-get expertise-counter)
+)
+
+(define-read-only (get-min-certification-cases)
+  (var-get min-certification-cases)
+)
+
+(define-read-only (is-qualified-arbitrator (arbitrator principal) (expertise-domain (string-ascii 30)) (min-certification uint))
+  (match (map-get? arbitrator-expertise { arbitrator: arbitrator, expertise-domain: expertise-domain })
+    expertise (>= (get certification-level expertise) min-certification)
+    false
+  )
+)
+
+(define-read-only (get-arbitrator-expertise-score (arbitrator principal) (expertise-domain (string-ascii 30)))
+  (match (map-get? arbitrator-expertise { arbitrator: arbitrator, expertise-domain: expertise-domain })
+    expertise (let (
+      (certification-level (get certification-level expertise))
+      (success-rate (get success-rate expertise))
+      (average-rating (get average-rating expertise))
+      (cases-handled (get cases-handled expertise))
+      (base-score (+ certification-level (* success-rate u2)))
+      (experience-bonus (if (>= cases-handled u5) u20 u0))
+      (rating-bonus (* average-rating u5))
+    )
+      (+ base-score experience-bonus rating-bonus)
+    )
+    u0
+  )
+)
+
+
+
+
+
+
