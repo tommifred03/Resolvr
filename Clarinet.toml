@@ -9,6 +9,10 @@ requirements = []
 path = 'contracts/Resolvr.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.DisputeSettlementTemplates]
+path = 'contracts/DisputeSettlementTemplates.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
